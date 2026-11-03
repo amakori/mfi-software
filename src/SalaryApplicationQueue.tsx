@@ -1,6 +1,6 @@
 import { FormEvent, useCallback, useEffect, useState } from 'react';
 import { Session } from '@supabase/supabase-js';
-import { CheckCircle2, Clock3, ExternalLink, FileText, LockKeyhole, LogIn, RefreshCw, ShieldCheck, XCircle } from 'lucide-react';
+import { CheckCircle2, Clock3, ExternalLink, FileText, LockKeyhole, LogIn, RefreshCw, ShieldCheck, X, XCircle } from 'lucide-react';
 import { createClient } from '@supabase/supabase-js';
 
 type SalaryApplication = {
@@ -24,7 +24,13 @@ type SalaryApplication = {
 
 const supabaseUrl = import.meta.env.VITE_SUPABASE_URL;
 const supabaseAnonKey = import.meta.env.VITE_SUPABASE_ANON_KEY;
+const mediaApiUrl = import.meta.env.VITE_MEDIA_API_URL?.replace(/\/+$/, '');
 const supabase = supabaseUrl && supabaseAnonKey ? createClient(supabaseUrl, supabaseAnonKey) : null;
+
+type ReviewDialog = {
+  application: SalaryApplication;
+  decision: 'approved' | 'rejected';
+};
 
 export default function SalaryApplicationQueue() {
   const [session, setSession] = useState<Session | null>(null);
@@ -33,6 +39,10 @@ export default function SalaryApplicationQueue() {
   const [busyId, setBusyId] = useState('');
   const [error, setError] = useState('');
   const [message, setMessage] = useState('');
+  const [reviewDialog, setReviewDialog] = useState<ReviewDialog | null>(null);
+  const [approvedLimit, setApprovedLimit] = useState('');
+  const [reviewerNotes, setReviewerNotes] = useState('');
+  const [reviewFormError, setReviewFormError] = useState('');
 
   useEffect(() => {
     if (!supabase) {
@@ -126,39 +136,47 @@ export default function SalaryApplicationQueue() {
     if (signInError) setError(signInError.message);
   };
 
-  const review = async (application: SalaryApplication, decision: 'approved' | 'rejected') => {
-    if (!supabase || !session?.user) return;
-    let reviewerNotes = '';
-    let approvedLimit: number | null = null;
+  const openReviewDialog = (application: SalaryApplication, decision: ReviewDialog['decision']) => {
+    setApprovedLimit(application.approved_limit ? String(application.approved_limit) : '');
+    setReviewerNotes('');
+    setReviewFormError('');
+    setReviewDialog({ application, decision });
+  };
 
+  useEffect(() => {
+    if (!reviewDialog) return;
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape' && !busyId) setReviewDialog(null);
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => window.removeEventListener('keydown', handleKeyDown);
+  }, [reviewDialog, busyId]);
+
+  const review = async (event: FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    if (!reviewDialog || !supabase || !session?.user) return;
+    const { application, decision } = reviewDialog;
+    let approvedLimitAmount: number | null = null;
     if (decision === 'approved') {
-      const limitInput = window.prompt(
-        `Enter the maximum outstanding salary-facility limit in ZMW for ${application.applicant_first_name} ${application.applicant_last_name}:`,
-        application.approved_limit ? String(application.approved_limit) : ''
-      );
-      if (limitInput === null) return; // user cancelled prompt
-      approvedLimit = Number(limitInput);
-      if (!Number.isFinite(approvedLimit) || approvedLimit <= 0) {
-        setError('Please enter a valid positive approved limit.');
+      approvedLimitAmount = Number(approvedLimit);
+      if (!Number.isFinite(approvedLimitAmount) || approvedLimitAmount <= 0) {
+        setReviewFormError('Enter a valid limit greater than ZMW 0.00.');
         return;
       }
-    } else {
-      const reason = window.prompt('Reason for declining this application (optional):');
-      if (reason === null) return;
-      reviewerNotes = reason.trim();
     }
 
     setBusyId(application.id);
+    setReviewFormError('');
     setError('');
     setMessage('');
     const updatePayload: Record<string, any> = {
       status: decision,
-      reviewer_notes: reviewerNotes || null,
+      reviewer_notes: reviewerNotes.trim() || null,
       reviewed_at: new Date().toISOString(),
       reviewed_by: session.user.id,
     };
-    if (decision === 'approved' && approvedLimit !== null) {
-      updatePayload.approved_limit = approvedLimit;
+    if (decision === 'approved' && approvedLimitAmount !== null) {
+      updatePayload.approved_limit = approvedLimitAmount;
     }
 
     const { data, error: reviewError } = await supabase
@@ -170,17 +188,19 @@ export default function SalaryApplicationQueue() {
       .maybeSingle();
     setBusyId('');
     if (reviewError) {
-      setError(reviewError.message);
+      setReviewFormError(reviewError.message);
       return;
     }
     if (!data) {
+      setReviewDialog(null);
       setError('This application has already been reviewed. Refresh the queue to see its latest status.');
       await loadApplications();
       return;
     }
+    setReviewDialog(null);
     setMessage(
       decision === 'approved'
-        ? `Application approved with limit ZMW ${approvedLimit?.toFixed(2)}. The applicant can now set their payment PIN in Sumthin.`
+        ? `Application approved with limit ZMW ${approvedLimitAmount?.toFixed(2)}. The applicant can now set their payment PIN in Sumthin.`
         : 'Application rejected.'
     );
     await loadApplications();
@@ -188,6 +208,52 @@ export default function SalaryApplicationQueue() {
 
   const openPayslip = async (application: SalaryApplication) => {
     if (!supabase || !application.payslip_url) return;
+    if (application.payslip_url.startsWith('r2://private/payslips/')) {
+      if (!mediaApiUrl) {
+        setError('Cloudflare media storage is not configured.');
+        return;
+      }
+      const key = application.payslip_url.slice('r2://'.length);
+      const objectPath = key.slice('private/payslips/'.length);
+      const payslipWindow = window.open('about:blank', '_blank');
+      if (!payslipWindow) {
+        setError('Allow pop-ups to view the payslip.');
+        return;
+      }
+      payslipWindow.opener = null;
+      try {
+        const { data: sessionData, error: sessionError } = await supabase.auth.getSession();
+        if (sessionError) throw sessionError;
+        let accessToken = sessionData.session?.access_token;
+        if (!accessToken) throw new Error('Your MFI session has expired. Sign in again to view this payslip.');
+        const encodedPath = objectPath.split('/').map(encodeURIComponent).join('/');
+        const payslipUrl = `${mediaApiUrl}/api/payslips/${encodedPath}`;
+        let response = await fetch(payslipUrl, {
+          headers: { Authorization: `Bearer ${accessToken}` },
+        });
+        if (response.status === 401) {
+          const { data: refreshed, error: refreshError } = await supabase.auth.refreshSession();
+          if (refreshError) throw refreshError;
+          accessToken = refreshed.session?.access_token;
+          if (!accessToken) throw new Error('Your MFI session has expired. Sign in again to view this payslip.');
+          response = await fetch(payslipUrl, {
+            headers: { Authorization: `Bearer ${accessToken}` },
+          });
+        }
+        if (!response.ok) {
+          const result = await response.json() as { error?: string };
+          throw new Error(result.error || 'Could not open payslip.');
+        }
+        const objectUrl = URL.createObjectURL(await response.blob());
+        payslipWindow.location.href = objectUrl;
+        window.setTimeout(() => URL.revokeObjectURL(objectUrl), 60_000);
+      } catch (payslipError) {
+        payslipWindow.close();
+        setError(payslipError instanceof Error ? payslipError.message : 'Could not open payslip.');
+      }
+      return;
+    }
+
     const marker = '/salary-payslips/';
     const markerIndex = application.payslip_url.indexOf(marker);
     if (markerIndex < 0) {
@@ -277,11 +343,110 @@ export default function SalaryApplicationQueue() {
             {application.payslip_url && <button onClick={() => void openPayslip(application)} className="mt-3 inline-flex items-center gap-1.5 text-xs font-medium text-sky-300 hover:text-sky-200"><FileText className="h-3.5 w-3.5" /> View payslip <ExternalLink className="h-3 w-3" /></button>}
           </div>
           {application.status === 'pending_mfi' && <div className="flex gap-2">
-            <button disabled={busyId === application.id} onClick={() => void review(application, 'approved')} className="flex items-center gap-1.5 rounded-lg bg-emerald-700 px-3 py-2 text-xs font-bold text-white hover:bg-emerald-600 disabled:opacity-50"><CheckCircle2 className="h-3.5 w-3.5" /> Approve</button>
-            <button disabled={busyId === application.id} onClick={() => void review(application, 'rejected')} className="flex items-center gap-1.5 rounded-lg border border-red-900 px-3 py-2 text-xs font-bold text-red-300 hover:bg-red-950 disabled:opacity-50"><XCircle className="h-3.5 w-3.5" /> Reject</button>
+            <button disabled={busyId === application.id} onClick={() => openReviewDialog(application, 'approved')} className="flex items-center gap-1.5 rounded-lg bg-emerald-700 px-3 py-2 text-xs font-bold text-white hover:bg-emerald-600 disabled:opacity-50"><CheckCircle2 className="h-3.5 w-3.5" /> Approve</button>
+            <button disabled={busyId === application.id} onClick={() => openReviewDialog(application, 'rejected')} className="flex items-center gap-1.5 rounded-lg border border-red-900 px-3 py-2 text-xs font-bold text-red-300 hover:bg-red-950 disabled:opacity-50"><XCircle className="h-3.5 w-3.5" /> Reject</button>
           </div>}
         </article>)}
       </div>}
     </div>
+    {reviewDialog && (
+      <div
+        className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/75 p-4 backdrop-blur-sm"
+        onMouseDown={(event) => {
+          if (event.target === event.currentTarget && !busyId) setReviewDialog(null);
+        }}
+      >
+        <section
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="salary-review-title"
+          className="w-full max-w-lg rounded-2xl border border-slate-700 bg-slate-900 p-5 shadow-2xl sm:p-6"
+        >
+          <div className="flex items-start justify-between gap-4">
+            <div className="flex items-start gap-3">
+              <span className={`mt-0.5 rounded-xl p-2 ${reviewDialog.decision === 'approved' ? 'bg-emerald-950 text-emerald-300' : 'bg-red-950 text-red-300'}`}>
+                {reviewDialog.decision === 'approved' ? <CheckCircle2 size={20} /> : <XCircle size={20} />}
+              </span>
+              <div>
+                <h2 id="salary-review-title" className="text-lg font-bold text-white">
+                  {reviewDialog.decision === 'approved' ? 'Approve salary facility' : 'Reject application'}
+                </h2>
+                <p className="mt-1 text-sm text-slate-400">
+                  {reviewDialog.application.applicant_first_name} {reviewDialog.application.applicant_last_name}
+                </p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={() => setReviewDialog(null)}
+              disabled={Boolean(busyId)}
+              aria-label="Close review dialog"
+              className="rounded-lg p-2 text-slate-400 hover:bg-slate-800 hover:text-white disabled:opacity-50"
+            >
+              <X size={18} />
+            </button>
+          </div>
+
+          <form className="mt-5 space-y-4" onSubmit={(event) => void review(event)}>
+            {reviewDialog.decision === 'approved' && (
+              <>
+                <p className="text-sm leading-6 text-slate-300">
+                  Set the maximum outstanding balance this applicant may authorize. The limit is separate from their reported monthly salary.
+                </p>
+                <div className="rounded-xl border border-slate-800 bg-slate-950/70 px-4 py-3">
+                  <p className="text-xs text-slate-400">Reported monthly salary</p>
+                  <p className="mt-1 font-semibold text-slate-100">ZMW {Number(reviewDialog.application.amount).toFixed(2)}</p>
+                </div>
+                <label className="block text-sm font-medium text-slate-200" htmlFor="approved-limit">
+                  Maximum outstanding limit (ZMW)
+                  <input
+                    id="approved-limit"
+                    autoFocus
+                    type="number"
+                    min="0.01"
+                    step="0.01"
+                    required
+                    value={approvedLimit}
+                    onChange={(event) => setApprovedLimit(event.currentTarget.value)}
+                    placeholder="e.g. 5000.00"
+                    className="mt-2 w-full rounded-lg border border-slate-700 bg-slate-950 px-3 py-2.5 text-sm text-white outline-none transition focus:border-emerald-500 focus:ring-2 focus:ring-emerald-500/20"
+                  />
+                </label>
+              </>
+            )}
+            <label className="block text-sm font-medium text-slate-200" htmlFor="reviewer-notes">
+              {reviewDialog.decision === 'approved' ? 'Review notes (optional)' : 'Reason for declining (optional)'}
+              <textarea
+                id="reviewer-notes"
+                rows={3}
+                maxLength={1000}
+                value={reviewerNotes}
+                onChange={(event) => setReviewerNotes(event.currentTarget.value)}
+                placeholder={reviewDialog.decision === 'approved' ? 'Add any notes for this application…' : 'Let the applicant know why this was declined…'}
+                className="mt-2 w-full resize-y rounded-lg border border-slate-700 bg-slate-950 px-3 py-2.5 text-sm text-white outline-none transition placeholder:text-slate-600 focus:border-sky-500 focus:ring-2 focus:ring-sky-500/20"
+              />
+            </label>
+            {reviewFormError && <p role="alert" className="rounded-lg border border-red-900 bg-red-950/40 p-3 text-sm text-red-300">{reviewFormError}</p>}
+            <div className="flex flex-col-reverse gap-2 border-t border-slate-800 pt-4 sm:flex-row sm:justify-end">
+              <button
+                type="button"
+                disabled={Boolean(busyId)}
+                onClick={() => setReviewDialog(null)}
+                className="rounded-lg border border-slate-700 px-4 py-2.5 text-sm font-semibold text-slate-300 hover:bg-slate-800 disabled:opacity-50"
+              >
+                Cancel
+              </button>
+              <button
+                type="submit"
+                disabled={Boolean(busyId)}
+                className={`flex items-center justify-center gap-2 rounded-lg px-4 py-2.5 text-sm font-bold text-white disabled:opacity-50 ${reviewDialog.decision === 'approved' ? 'bg-emerald-700 hover:bg-emerald-600' : 'bg-red-700 hover:bg-red-600'}`}
+              >
+                {busyId ? 'Saving review…' : reviewDialog.decision === 'approved' ? 'Approve facility' : 'Reject application'}
+              </button>
+            </div>
+          </form>
+        </section>
+      </div>
+    )}
   </section>;
 }
